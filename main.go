@@ -1,7 +1,6 @@
 package main
 
 import (
-    "fmt"
     "log"
     "net/http"
     "os"
@@ -23,14 +22,14 @@ var upgrader = websocket.Upgrader{
 var peers = make(map[*websocket.Conn]bool)
 
 func main() {
-    // Load .env file if present
-    _ = godotenv.Load()
+    log.SetFlags(log.LstdFlags | log.Lshortfile)
+    log.Println("Server starting...")
 
+    _ = godotenv.Load()
     host := os.Getenv("HOST")
     if host == "" {
         host = "0.0.0.0"
     }
-
     port := os.Getenv("PORT")
     if port == "" {
         port = "8080"
@@ -39,14 +38,14 @@ func main() {
     http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
         c, err := upgrader.Upgrade(w, r, nil)
         if err != nil {
-            fmt.Println("Upgrade error:", err)
+            log.Println("Upgrade error:", err)
             return
         }
-        fmt.Println("Client connected")
+        log.Println("Client connected")
         peers[c] = true
 
         defer func() {
-            fmt.Println("Client disconnected")
+            log.Println("Client disconnected")
             delete(peers, c)
             c.Close()
         }()
@@ -54,13 +53,13 @@ func main() {
         for {
             _, msg, err := c.ReadMessage()
             if err != nil {
-                fmt.Println("Read error:", err)
+                log.Println("Read error:", err)
                 break
             }
             for p := range peers {
                 if p != c {
                     if err := p.WriteMessage(websocket.TextMessage, msg); err != nil {
-                        fmt.Println("Write error:", err)
+                        log.Println("Write error:", err)
                     }
                 }
             }
