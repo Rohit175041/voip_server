@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"sync"
 	"time"
+
 	"github.com/gorilla/websocket"
 )
 
@@ -13,8 +15,9 @@ var upgrader = websocket.Upgrader{
 }
 
 type Room struct {
-	clients map[*websocket.Conn]bool
-	timer   *time.Timer
+	clients    map[*websocket.Conn]bool
+	cleanup    *time.Timer // cleanup after empty
+	oneUserTmr *time.Timer // 2 min timer if only 1 user
 }
 
 var (
@@ -24,8 +27,7 @@ var (
 
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
-
-	log.Println("WebSocket signalling server running on :8080/ws")
+	log.Println("✅ WebSocket signalling server running on :8080/ws")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -41,37 +43,90 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Join room
 	mu.Lock()
 	room, ok := rooms[roomID]
 	if !ok {
 		room = &Room{clients: make(map[*websocket.Conn]bool)}
 		rooms[roomID] = room
 	}
-	// If there was a cleanup timer pending, stop it because a user joined
-	if room.timer != nil {
-		room.timer.Stop()
-		room.timer = nil
+	// cancel pending cleanup
+	if room.cleanup != nil {
+		room.cleanup.Stop()
+		room.cleanup = nil
 	}
 	room.clients[c] = true
+	clientCount := len(room.clients)
+
+	// Start 2-min timer if only one user
+	if clientCount == 1 {
+		if room.oneUserTmr != nil {
+			room.oneUserTmr.Stop()
+		}
+		room.oneUserTmr = time.AfterFunc(2*time.Minute, func() {
+			mu.Lock()
+			defer mu.Unlock()
+			if r, exists := rooms[roomID]; exists && len(r.clients) == 1 {
+				log.Printf("⏳ Room %s timed out after 2 min (only one user)", roomID)
+				for client := range r.clients {
+					client.WriteJSON(map[string]string{
+						"type":    "timeout",
+						"message": "No one joined within 2 minutes. Please end the call.",
+					})
+				}
+			}
+		})
+	} else if clientCount >= 2 && room.oneUserTmr != nil {
+		// cancel one-user timer once someone else joins
+		room.oneUserTmr.Stop()
+		room.oneUserTmr = nil
+	}
+
 	mu.Unlock()
 
-	log.Printf("Client joined room: %s (total %d)\n", roomID, len(room.clients))
+	log.Printf("Client joined room: %s (total %d)\n", roomID, clientCount)
+	broadcastRoomSize(roomID)
 
+	// Cleanup on leave
 	defer func() {
 		mu.Lock()
 		delete(room.clients, c)
-		empty := len(room.clients) == 0
+		clientCount := len(room.clients)
 		mu.Unlock()
 
 		c.Close()
-		log.Printf("Client left room: %s\n", roomID)
+		log.Printf("Client left room: %s (remaining %d)\n", roomID, clientCount)
+		broadcastRoomSize(roomID)
 
-		// If the room is empty, schedule cleanup after 20s
-		if empty {
+		if clientCount == 0 {
 			scheduleRoomCleanup(roomID)
+		} else if clientCount == 1 {
+			// restart 2-min timer for the remaining single user
+			mu.Lock()
+			r := rooms[roomID]
+			if r != nil {
+				if r.oneUserTmr != nil {
+					r.oneUserTmr.Stop()
+				}
+				r.oneUserTmr = time.AfterFunc(2*time.Minute, func() {
+					mu.Lock()
+					defer mu.Unlock()
+					if rr, exists := rooms[roomID]; exists && len(rr.clients) == 1 {
+						log.Printf("⏳ Room %s timed out after 2 min (only one user left)", roomID)
+						for client := range rr.clients {
+							client.WriteJSON(map[string]string{
+								"type":    "timeout",
+								"message": "No one joined within 2 minutes. Please end the call.",
+							})
+						}
+					}
+				})
+			}
+			mu.Unlock()
 		}
 	}()
 
+	// Listen messages and forward to peers
 	for {
 		_, msg, err := c.ReadMessage()
 		if err != nil {
@@ -99,12 +154,12 @@ func scheduleRoomCleanup(roomID string) {
 		return
 	}
 
-	if room.timer != nil {
+	if room.cleanup != nil {
 		mu.Unlock()
 		return // already scheduled
 	}
 
-	room.timer = time.AfterFunc(20*time.Second, func() {
+	room.cleanup = time.AfterFunc(20*time.Second, func() {
 		mu.Lock()
 		defer mu.Unlock()
 		if r, exists := rooms[roomID]; exists && len(r.clients) == 0 {
@@ -113,4 +168,21 @@ func scheduleRoomCleanup(roomID string) {
 		}
 	})
 	mu.Unlock()
+}
+
+func broadcastRoomSize(roomID string) {
+	mu.Lock()
+	defer mu.Unlock()
+	room, ok := rooms[roomID]
+	if !ok {
+		return
+	}
+	size := len(room.clients)
+	msg, _ := json.Marshal(map[string]interface{}{
+		"type":  "roomSize",
+		"count": size,
+	})
+	for c := range room.clients {
+		c.WriteMessage(websocket.TextMessage, msg)
+	}
 }
