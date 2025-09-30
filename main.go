@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
+	log "github.com/sirupsen/logrus"
 )
 
 // -------------------- Config --------------------
@@ -29,6 +29,7 @@ var (
 func init() {
 	_ = godotenv.Load()
 
+	// --- Load environment ---
 	host := getEnv("HOST", "0.0.0.0")
 	port := getEnv("PORT", "8080")
 	serverAddr = host + ":" + port
@@ -41,6 +42,24 @@ func init() {
 	writeTimeout = getEnvDuration("WRITE_TIMEOUT", 5*time.Second)
 	pingInterval = getEnvDuration("PING_INTERVAL", 30*time.Second)
 
+	// --- Logging config ---
+	logLevel := getEnv("LOG_LEVEL", "info")
+	switch logLevel {
+	case "debug":
+		log.SetLevel(log.DebugLevel)
+	case "warn":
+		log.SetLevel(log.WarnLevel)
+	case "error":
+		log.SetLevel(log.ErrorLevel)
+	default:
+		log.SetLevel(log.InfoLevel)
+	}
+	log.SetFormatter(&log.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+	})
+
+	// --- WebSocket origin check ---
 	upgrader.CheckOrigin = func(r *http.Request) bool {
 		if allowedOrigin == "*" {
 			return true
@@ -104,7 +123,7 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	log.Printf("✅ WebSocket signalling server running on %s/ws", serverAddr)
+	log.Infof("✅ WebSocket signalling server running on %s/ws", serverAddr)
 	log.Fatal(http.ListenAndServe(serverAddr, nil))
 }
 
@@ -118,7 +137,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Upgrade error:", err)
+		log.Warnf("Upgrade error: %v", err)
 		return
 	}
 
@@ -142,7 +161,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(room.clients) >= maxRoomClients {
 		mu.Unlock()
-		log.Printf("❌ Room %s is full (max %d)", roomID, maxRoomClients)
+		log.Warnf("❌ Room %s is full (max %d)", roomID, maxRoomClients)
 		_ = c.WriteJSON(map[string]string{"type": "error", "message": "Room full"})
 		c.Close()
 		return
@@ -151,7 +170,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	count := len(room.clients)
 	mu.Unlock()
 
-	log.Printf("👤 Client joined room %s (total %d)", roomID, count)
+	log.Infof("👤 Client joined room %s (total %d)", roomID, count)
 	broadcastRoomSize(roomID)
 	startOneUserTimerIfNeeded(roomID)
 
@@ -163,7 +182,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			mu.Unlock()
 
 			c.Close()
-			log.Printf("👋 Client left room %s (remaining %d)", roomID, remaining)
+			log.Infof("👋 Client left room %s (remaining %d)", roomID, remaining)
 			broadcastRoomSize(roomID)
 
 			if remaining == 0 {
@@ -180,15 +199,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, msg, err := c.ReadMessage()
 		if err != nil {
-			log.Println("Read error:", err)
+			log.Warnf("Read error: %v", err)
 			break
 		}
-		log.Printf("[%s] relay: %s", roomID, string(msg))
+		log.Debugf("[%s] relay: %s", roomID, string(msg))
 		mu.Lock()
 		for peer := range room.clients {
 			if peer != c {
 				if err := writeWithDeadline(peer, websocket.TextMessage, msg); err != nil {
-					log.Println("Write error:", err)
+					log.Errorf("Write error: %v", err)
 				}
 			}
 		}
@@ -213,7 +232,7 @@ func startOneUserTimerIfNeeded(roomID string) {
 			mu.Lock()
 			defer mu.Unlock()
 			if r, exists := rooms[roomID]; exists && len(r.clients) == 1 {
-				log.Printf("⏳ Room %s timed out after %v with only one user", roomID, oneUserWait)
+				log.Infof("⏳ Room %s timed out after %v with only one user", roomID, oneUserWait)
 				for client := range r.clients {
 					_ = writeJSONWithDeadline(client, map[string]string{
 						"type":    "timeout",
@@ -244,7 +263,7 @@ func scheduleRoomCleanup(roomID string) {
 		defer mu.Unlock()
 		if r, exists := rooms[roomID]; exists && len(r.clients) == 0 {
 			delete(rooms, roomID)
-			log.Printf("🧹 Room %s cleaned up after %v inactivity", roomID, roomCleanupWait)
+			log.Infof("🧹 Room %s cleaned up after %v inactivity", roomID, roomCleanupWait)
 		}
 	})
 	mu.Unlock()
