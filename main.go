@@ -4,20 +4,90 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+// -------------------- Config --------------------
+
+var (
+	serverAddr      string
+	allowedOrigin   string
+	maxRoomClients  int
+	oneUserWait     time.Duration
+	roomCleanupWait time.Duration
+	readLimit       int64
+	writeTimeout    time.Duration
+	pingInterval    time.Duration
+)
+
+func init() {
+	_ = godotenv.Load()
+
+	host := getEnv("HOST", "0.0.0.0")
+	port := getEnv("PORT", "8080")
+	serverAddr = host + ":" + port
+
+	allowedOrigin = getEnv("ALLOWED_ORIGIN", "*")
+	maxRoomClients = getEnvInt("MAX_ROOM_CLIENTS", 2)
+	oneUserWait = getEnvDuration("ONE_USER_WAIT", 2*time.Minute)
+	roomCleanupWait = getEnvDuration("ROOM_CLEANUP_WAIT", 20*time.Second)
+	readLimit = getEnvInt64("READ_LIMIT", 2*1024*1024)
+	writeTimeout = getEnvDuration("WRITE_TIMEOUT", 5*time.Second)
+	pingInterval = getEnvDuration("PING_INTERVAL", 30*time.Second)
+
+	upgrader.CheckOrigin = func(r *http.Request) bool {
+		if allowedOrigin == "*" {
+			return true
+		}
+		return r.Header.Get("Origin") == allowedOrigin
+	}
 }
+
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+func getEnvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if val, err := strconv.Atoi(v); err == nil {
+			return val
+		}
+	}
+	return def
+}
+func getEnvInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if val, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return val
+		}
+	}
+	return def
+}
+func getEnvDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if val, err := time.ParseDuration(v); err == nil {
+			return val
+		}
+	}
+	return def
+}
+
+// -------------------- Types --------------------
+
+var upgrader = websocket.Upgrader{}
 
 type Room struct {
 	clients    map[*websocket.Conn]bool
-	cleanup    *time.Timer // cleanup after empty
-	oneUserTmr *time.Timer // 2 min timer if only one user
+	cleanup    *time.Timer
+	oneUserTmr *time.Timer
 }
 
 var (
@@ -25,11 +95,20 @@ var (
 	mu    sync.Mutex
 )
 
+// -------------------- Main --------------------
+
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
-	log.Println("✅ WebSocket signalling server running on :8080/ws")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	log.Printf("✅ WebSocket signalling server running on %s/ws", serverAddr)
+	log.Fatal(http.ListenAndServe(serverAddr, nil))
 }
+
+// -------------------- Handler --------------------
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	roomID := r.URL.Query().Get("room")
@@ -43,44 +122,53 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ---------------- JOIN ROOM ----------------
+	c.SetReadLimit(readLimit)
+	c.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.SetPongHandler(func(string) error {
+		c.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// JOIN ROOM
 	mu.Lock()
 	room, ok := rooms[roomID]
 	if !ok {
 		room = &Room{clients: make(map[*websocket.Conn]bool)}
 		rooms[roomID] = room
 	}
-	// cancel any pending cleanup
 	if room.cleanup != nil {
 		room.cleanup.Stop()
 		room.cleanup = nil
 	}
-
+	if len(room.clients) >= maxRoomClients {
+		mu.Unlock()
+		log.Printf("❌ Room %s is full (max %d)", roomID, maxRoomClients)
+		_ = c.WriteJSON(map[string]string{"type": "error", "message": "Room full"})
+		c.Close()
+		return
+	}
 	room.clients[c] = true
-	clientCount := len(room.clients)
+	count := len(room.clients)
 	mu.Unlock()
 
-	log.Printf("👤 Client joined room: %s (total %d)", roomID, clientCount)
-
-	// broadcast size & start one-user timer if needed
+	log.Printf("👤 Client joined room %s (total %d)", roomID, count)
 	broadcastRoomSize(roomID)
 	startOneUserTimerIfNeeded(roomID)
 
-	// ---------------- CLEANUP ON LEAVE ----------------
 	defer func() {
 		mu.Lock()
 		if r, ok := rooms[roomID]; ok {
 			delete(r.clients, c)
-			clientCount := len(r.clients)
+			remaining := len(r.clients)
 			mu.Unlock()
 
 			c.Close()
-			log.Printf("👋 Client left room: %s (remaining %d)", roomID, clientCount)
+			log.Printf("👋 Client left room %s (remaining %d)", roomID, remaining)
 			broadcastRoomSize(roomID)
 
-			if clientCount == 0 {
+			if remaining == 0 {
 				scheduleRoomCleanup(roomID)
-			} else if clientCount == 1 {
+			} else if remaining == 1 {
 				startOneUserTimerIfNeeded(roomID)
 			}
 		} else {
@@ -88,17 +176,18 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// ---------------- LISTEN & RELAY MESSAGES ----------------
+	// LISTEN & RELAY
 	for {
 		_, msg, err := c.ReadMessage()
 		if err != nil {
 			log.Println("Read error:", err)
 			break
 		}
+		log.Printf("[%s] relay: %s", roomID, string(msg))
 		mu.Lock()
 		for peer := range room.clients {
 			if peer != c {
-				if err := peer.WriteMessage(websocket.TextMessage, msg); err != nil {
+				if err := writeWithDeadline(peer, websocket.TextMessage, msg); err != nil {
 					log.Println("Write error:", err)
 				}
 			}
@@ -107,9 +196,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- UTILITIES ---
+// -------------------- Utilities --------------------
 
-// Start a 2-min timer if the room has exactly one user
 func startOneUserTimerIfNeeded(roomID string) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -121,27 +209,25 @@ func startOneUserTimerIfNeeded(roomID string) {
 		if room.oneUserTmr != nil {
 			room.oneUserTmr.Stop()
 		}
-		room.oneUserTmr = time.AfterFunc(2*time.Minute, func() {
+		room.oneUserTmr = time.AfterFunc(oneUserWait, func() {
 			mu.Lock()
 			defer mu.Unlock()
 			if r, exists := rooms[roomID]; exists && len(r.clients) == 1 {
-				log.Printf("⏳ Room %s timed out after 2 minutes with only one user", roomID)
+				log.Printf("⏳ Room %s timed out after %v with only one user", roomID, oneUserWait)
 				for client := range r.clients {
-					_ = client.WriteJSON(map[string]string{
+					_ = writeJSONWithDeadline(client, map[string]string{
 						"type":    "timeout",
-						"message": "No one joined within 2 minutes. Please end the call.",
+						"message": "No one joined within the wait time. Please end the call.",
 					})
 				}
 			}
 		})
 	} else if len(room.clients) >= 2 && room.oneUserTmr != nil {
-		// cancel timer if now 2+ users
 		room.oneUserTmr.Stop()
 		room.oneUserTmr = nil
 	}
 }
 
-// Clean up a room after 20 seconds if empty
 func scheduleRoomCleanup(roomID string) {
 	mu.Lock()
 	room, ok := rooms[roomID]
@@ -149,24 +235,21 @@ func scheduleRoomCleanup(roomID string) {
 		mu.Unlock()
 		return
 	}
-
 	if room.cleanup != nil {
 		mu.Unlock()
-		return // already scheduled
+		return
 	}
-
-	room.cleanup = time.AfterFunc(20*time.Second, func() {
+	room.cleanup = time.AfterFunc(roomCleanupWait, func() {
 		mu.Lock()
 		defer mu.Unlock()
 		if r, exists := rooms[roomID]; exists && len(r.clients) == 0 {
 			delete(rooms, roomID)
-			log.Printf("🧹 Room %s cleaned up after 20s inactivity", roomID)
+			log.Printf("🧹 Room %s cleaned up after %v inactivity", roomID, roomCleanupWait)
 		}
 	})
 	mu.Unlock()
 }
 
-// Send current room size to all clients
 func broadcastRoomSize(roomID string) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -174,13 +257,19 @@ func broadcastRoomSize(roomID string) {
 	if !ok {
 		return
 	}
-	msg, _ := json.Marshal(map[string]interface{}{
-		"type":  "roomSize",
-		"count": len(room.clients),
-	})
+	msg, _ := json.Marshal(map[string]interface{}{"type": "roomSize", "count": len(room.clients)})
 	for c := range room.clients {
-		if err := c.WriteMessage(websocket.TextMessage, msg); err != nil {
-			log.Println("Write error:", err)
-		}
+		_ = writeWithDeadline(c, websocket.TextMessage, msg)
 	}
+}
+
+// -------------------- WS helpers --------------------
+
+func writeWithDeadline(c *websocket.Conn, msgType int, data []byte) error {
+	c.SetWriteDeadline(time.Now().Add(writeTimeout))
+	return c.WriteMessage(msgType, data)
+}
+func writeJSONWithDeadline(c *websocket.Conn, v interface{}) error {
+	c.SetWriteDeadline(time.Now().Add(writeTimeout))
+	return c.WriteJSON(v)
 }
