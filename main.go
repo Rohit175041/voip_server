@@ -161,6 +161,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	stopPing := make(chan struct{})
 
+	// ---------- FULLY LOCKED JOIN ----------
 	mu.Lock()
 	room, ok := rooms[roomID]
 	if !ok {
@@ -181,6 +182,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	room.clients[c] = stopPing
 	count := len(room.clients)
 	mu.Unlock()
+	// ----------------------------------------
 
 	log.Infof("👤 Client %s joined room %s (total %d)", remoteIP, roomID, count)
 	broadcastRoomSize(roomID)
@@ -227,7 +229,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		for peer := range room.clients {
 			if peer != c {
 				if err := writeWithDeadline(peer, websocket.TextMessage, msg); err != nil {
-					log.Warnf("Write error: %v", err)
+					log.Warnf("Write error to %s: %v", peer.RemoteAddr(), err)
 				}
 			}
 		}
