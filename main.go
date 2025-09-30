@@ -43,8 +43,7 @@ func init() {
 	pingInterval = getEnvDuration("PING_INTERVAL", 30*time.Second)
 
 	// --- Logging config ---
-	logLevel := getEnv("LOG_LEVEL", "info")
-	switch logLevel {
+	switch getEnv("LOG_LEVEL", "info") {
 	case "debug":
 		log.SetLevel(log.DebugLevel)
 	case "warn":
@@ -140,7 +139,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Warnf("Upgrade error: %v", err)
 		return
 	}
-
 	c.SetReadLimit(readLimit)
 	c.SetReadDeadline(time.Now().Add(60 * time.Second))
 	c.SetPongHandler(func(string) error {
@@ -148,7 +146,9 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
-	// JOIN ROOM
+	joined := false
+
+	// --- JOIN ROOM ---
 	mu.Lock()
 	room, ok := rooms[roomID]
 	if !ok {
@@ -167,6 +167,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	room.clients[c] = true
+	joined = true
 	count := len(room.clients)
 	mu.Unlock()
 
@@ -174,40 +175,50 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	broadcastRoomSize(roomID)
 	startOneUserTimerIfNeeded(roomID)
 
-	defer func() {
-		mu.Lock()
-		if r, ok := rooms[roomID]; ok {
-			delete(r.clients, c)
-			remaining := len(r.clients)
-			mu.Unlock()
+	if joined {
+		defer func() {
+			mu.Lock()
+			if r, ok := rooms[roomID]; ok {
+				delete(r.clients, c)
+				remaining := len(r.clients)
+				mu.Unlock()
 
-			c.Close()
-			log.Infof("👋 Client left room %s (remaining %d)", roomID, remaining)
-			broadcastRoomSize(roomID)
+				_ = c.Close()
+				log.Infof("👋 Client left room %s (remaining %d)", roomID, remaining)
+				broadcastRoomSize(roomID)
 
-			if remaining == 0 {
-				scheduleRoomCleanup(roomID)
-			} else if remaining == 1 {
-				startOneUserTimerIfNeeded(roomID)
+				if remaining == 0 {
+					scheduleRoomCleanup(roomID)
+				} else if remaining == 1 {
+					startOneUserTimerIfNeeded(roomID)
+				}
+			} else {
+				mu.Unlock()
 			}
-		} else {
-			mu.Unlock()
-		}
-	}()
+		}()
+	}
 
-	// LISTEN & RELAY
-	for {
+	// --- LISTEN & RELAY ---
+	for joined {
 		_, msg, err := c.ReadMessage()
 		if err != nil {
-			log.Warnf("Read error: %v", err)
+			// classify error
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Infof("Normal disconnect: %v", err)
+			} else if ne, ok := err.(interface{ Timeout() bool }); ok && ne.Timeout() {
+				log.Infof("Read timeout: %v", err)
+			} else {
+				log.Warnf("Read error: %v", err)
+			}
 			break
 		}
-		log.Debugf("[%s] relay: %s", roomID, string(msg))
+		log.Debugf("[%s] relay %d bytes", roomID, len(msg))
+
 		mu.Lock()
 		for peer := range room.clients {
 			if peer != c {
 				if err := writeWithDeadline(peer, websocket.TextMessage, msg); err != nil {
-					log.Errorf("Write error: %v", err)
+					log.Warnf("Write error: %v", err)
 				}
 			}
 		}
