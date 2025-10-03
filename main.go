@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -20,7 +21,7 @@ import (
 
 var (
 	serverAddr      string
-	allowedOrigin   string
+	allowedOrigins  []string
 	maxRoomClients  int
 	oneUserWait     time.Duration
 	roomCleanupWait time.Duration
@@ -37,14 +38,22 @@ func init() {
 	port := getEnv("PORT", "8080")
 	serverAddr = host + ":" + port
 
-	allowedOrigin = getEnv("ALLOWED_ORIGIN", "*")
+	// Accept comma separated ALLOWED_ORIGIN or "*" to disable check
+	origins := getEnv("ALLOWED_ORIGIN", "*")
+	for _, o := range strings.Split(origins, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			allowedOrigins = append(allowedOrigins, o)
+		}
+	}
+
 	maxRoomClients = getEnvInt("MAX_ROOM_CLIENTS", 2)
 	oneUserWait = getEnvDuration("ONE_USER_WAIT", 2*time.Minute)
 	roomCleanupWait = getEnvDuration("ROOM_CLEANUP_WAIT", 20*time.Second)
 	readLimit = getEnvInt64("READ_LIMIT", 2*1024*1024)
 	writeTimeout = getEnvDuration("WRITE_TIMEOUT", 5*time.Second)
 	pingInterval = getEnvDuration("PING_INTERVAL", 30*time.Second)
-	idleTimeout = getEnvDuration("IDLE_TIMEOUT", 60*time.Second)
+	idleTimeout = getEnvDuration("IDLE_TIMEOUT", 120*time.Second) // safer for prod
 
 	switch getEnv("LOG_LEVEL", "info") {
 	case "debug":
@@ -62,10 +71,20 @@ func init() {
 	})
 
 	upgrader.CheckOrigin = func(r *http.Request) bool {
-		if allowedOrigin == "*" {
+		if len(allowedOrigins) == 0 || (len(allowedOrigins) == 1 && allowedOrigins[0] == "*") {
 			return true
 		}
-		return r.Header.Get("Origin") == allowedOrigin
+		origin := r.Header.Get("Origin")
+		for _, o := range allowedOrigins {
+			if origin == o {
+				return true
+			}
+		}
+		// allow if Origin missing (native app) and same host
+		if origin == "" && strings.HasPrefix(r.Host, r.URL.Host) {
+			return true
+		}
+		return false
 	}
 }
 
@@ -102,10 +121,13 @@ func getEnvDuration(key string, def time.Duration) time.Duration {
 
 // -------------------- Types --------------------
 
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+}
 
 type Room struct {
-	clients    map[*websocket.Conn]chan struct{} // each client has stopPing channel
+	clients    map[*websocket.Conn]chan struct{} // stopPing channel
 	cleanup    *time.Timer
 	oneUserTmr *time.Timer
 }
@@ -127,7 +149,7 @@ func main() {
 	http.HandleFunc("/ws", handleWebSocket)
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	http.HandleFunc("/metrics", metricsHandler)
 
@@ -145,23 +167,23 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		roomID = "default"
 	}
 
-	c, err := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Warnf("Upgrade error: %v", err)
 		return
 	}
 
-	remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	c.SetReadLimit(readLimit)
-	c.SetReadDeadline(time.Now().Add(idleTimeout))
-	c.SetPongHandler(func(string) error {
-		c.SetReadDeadline(time.Now().Add(idleTimeout))
+	remoteIP := realIP(r)
+	conn.SetReadLimit(readLimit)
+	conn.SetReadDeadline(time.Now().Add(idleTimeout))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(idleTimeout))
 		return nil
 	})
 
 	stopPing := make(chan struct{})
 
-	// ---------- FULLY LOCKED JOIN ----------
+	// ---------- LOCK & JOIN ----------
 	mu.Lock()
 	room, ok := rooms[roomID]
 	if !ok {
@@ -174,31 +196,31 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(room.clients) >= maxRoomClients {
 		mu.Unlock()
-		log.Warnf("❌ Room %s is full (max %d)", roomID, maxRoomClients)
-		_ = c.WriteJSON(ErrorMessage{Type: "error", Code: 403, Message: "Room full"})
-		_ = c.Close()
+		log.Warnf("❌ Room %s full", roomID)
+		_ = conn.WriteJSON(ErrorMessage{Type: "error", Code: 403, Message: "Room full"})
+		_ = conn.Close()
 		return
 	}
-	room.clients[c] = stopPing
+	room.clients[conn] = stopPing
 	count := len(room.clients)
 	mu.Unlock()
-	// ----------------------------------------
+	// -----------------------------------
 
-	log.Infof("👤 Client %s joined room %s (total %d)", remoteIP, roomID, count)
+	log.Infof("👤 %s joined room %s (total %d)", remoteIP, roomID, count)
 	broadcastRoomSize(roomID)
 	startOneUserTimerIfNeeded(roomID)
-	startPingLoop(c, stopPing)
+	startPingLoop(conn, stopPing)
 
 	defer func() {
 		close(stopPing)
 		mu.Lock()
 		if r, ok := rooms[roomID]; ok {
-			delete(r.clients, c)
+			delete(r.clients, conn)
 			remaining := len(r.clients)
 			mu.Unlock()
 
-			_ = c.Close()
-			log.Infof("👋 Client %s left room %s (remaining %d)", remoteIP, roomID, remaining)
+			_ = conn.Close()
+			log.Infof("👋 %s left room %s (remaining %d)", remoteIP, roomID, remaining)
 			broadcastRoomSize(roomID)
 
 			if remaining == 0 {
@@ -212,7 +234,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	for {
-		_, msg, err := c.ReadMessage()
+		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				log.Infof("Normal disconnect %s: %v", remoteIP, err)
@@ -223,11 +245,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			break
 		}
-		log.Debugf("[%s] relay %d bytes", roomID, len(msg))
 
+		// Relay to peers
 		mu.Lock()
 		for peer := range room.clients {
-			if peer != c {
+			if peer != conn {
 				if err := writeWithDeadline(peer, websocket.TextMessage, msg); err != nil {
 					log.Warnf("Write error to %s: %v", peer.RemoteAddr(), err)
 				}
@@ -238,6 +260,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 // -------------------- Utilities --------------------
+
+func realIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	h, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return h
+}
 
 func startPingLoop(c *websocket.Conn, stop <-chan struct{}) {
 	ticker := time.NewTicker(pingInterval)
@@ -305,7 +336,7 @@ func scheduleRoomCleanup(roomID string) {
 		defer mu.Unlock()
 		if r, exists := rooms[roomID]; exists && len(r.clients) == 0 {
 			delete(rooms, roomID)
-			log.Infof("🧹 Room %s cleaned up after %v inactivity", roomID, roomCleanupWait)
+			log.Infof("🧹 Room %s cleaned after %v inactivity", roomID, roomCleanupWait)
 		}
 	})
 	mu.Unlock()
