@@ -34,14 +34,11 @@ Github backend and frontend repo
 https://github.com/Rohit175041/voip_server
 https://github.com/Rohit175041/lan-voip
 ```
-
-```
 ## 📡 WebRTC P2P Architecture
 <p align="center">
   <img src="./assets/p2p.webp" alt="P2P WebRTC Architecture" width="700"/>
 </p>
 
-```
 ## 🚀 Quick Start
 
 ### 1️⃣ Clone the repository
