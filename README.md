@@ -29,7 +29,11 @@ This backend is designed to work seamlessly with a React-based WebRTC frontend f
 | Frontend Compatibility | React, Vanilla JS, WebRTC APIs |
 
 ---
-
+Github backend and frontend repo
+```
+https://github.com/Rohit175041/voip_server
+https://github.com/Rohit175041/lan-voip
+```
 ## 🚀 Quick Start
 
 ### 1️⃣ Clone the repository
