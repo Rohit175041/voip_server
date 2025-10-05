@@ -9,6 +9,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// loadEnvConfig loads .env file into environment
 func loadEnvConfig() {
 	_ = godotenv.Load()
 }

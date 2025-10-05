@@ -4,6 +4,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// initLogger sets up logging format and level
 func initLogger(level string) {
 	switch level {
 	case "debug":
