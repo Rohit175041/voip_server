@@ -1,116 +1,73 @@
 package main
 
 import (
-	"log"
-	"net/http"
-	"sync"
-	"time"
-	"github.com/gorilla/websocket"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+
+    "github.com/joho/godotenv"
+    "github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+    CheckOrigin: func(r *http.Request) bool {
+        allowed := os.Getenv("ALLOWED_ORIGIN")
+        if allowed == "*" || allowed == "" {
+            return true
+        }
+        return r.Header.Get("Origin") == allowed
+    },
 }
 
-type Room struct {
-	clients map[*websocket.Conn]bool
-	timer   *time.Timer
-}
-
-var (
-	rooms = make(map[string]*Room)
-	mu    sync.Mutex
-)
+var peers = make(map[*websocket.Conn]bool)
 
 func main() {
-	http.HandleFunc("/ws", handleWebSocket)
+    // Load .env file if present
+    _ = godotenv.Load()
 
-	log.Println("WebSocket signalling server running on :8080/ws")
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
+    host := os.Getenv("HOST")
+    if host == "" {
+        host = "0.0.0.0"
+    }
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	roomID := r.URL.Query().Get("room")
-	if roomID == "" {
-		roomID = "default"
-	}
+    port := os.Getenv("PORT")
+    if port == "" {
+        port = "8080"
+    }
 
-	c, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Upgrade error:", err)
-		return
-	}
+    http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+        c, err := upgrader.Upgrade(w, r, nil)
+        if err != nil {
+            fmt.Println("Upgrade error:", err)
+            return
+        }
+        fmt.Println("Client connected")
+        peers[c] = true
 
-	mu.Lock()
-	room, ok := rooms[roomID]
-	if !ok {
-		room = &Room{clients: make(map[*websocket.Conn]bool)}
-		rooms[roomID] = room
-	}
-	// If there was a cleanup timer pending, stop it because a user joined
-	if room.timer != nil {
-		room.timer.Stop()
-		room.timer = nil
-	}
-	room.clients[c] = true
-	mu.Unlock()
+        defer func() {
+            fmt.Println("Client disconnected")
+            delete(peers, c)
+            c.Close()
+        }()
 
-	log.Printf("Client joined room: %s (total %d)\n", roomID, len(room.clients))
+        for {
+            _, msg, err := c.ReadMessage()
+            if err != nil {
+                fmt.Println("Read error:", err)
+                break
+            }
+            for p := range peers {
+                if p != c {
+                    if err := p.WriteMessage(websocket.TextMessage, msg); err != nil {
+                        fmt.Println("Write error:", err)
+                    }
+                }
+            }
+        }
+    })
 
-	defer func() {
-		mu.Lock()
-		delete(room.clients, c)
-		empty := len(room.clients) == 0
-		mu.Unlock()
-
-		c.Close()
-		log.Printf("Client left room: %s\n", roomID)
-
-		// If the room is empty, schedule cleanup after 20s
-		if empty {
-			scheduleRoomCleanup(roomID)
-		}
-	}()
-
-	for {
-		_, msg, err := c.ReadMessage()
-		if err != nil {
-			log.Println("Read error:", err)
-			break
-		}
-
-		mu.Lock()
-		for peer := range room.clients {
-			if peer != c {
-				if err := peer.WriteMessage(websocket.TextMessage, msg); err != nil {
-					log.Println("Write error:", err)
-				}
-			}
-		}
-		mu.Unlock()
-	}
-}
-
-func scheduleRoomCleanup(roomID string) {
-	mu.Lock()
-	room, ok := rooms[roomID]
-	if !ok {
-		mu.Unlock()
-		return
-	}
-
-	if room.timer != nil {
-		mu.Unlock()
-		return // already scheduled
-	}
-
-	room.timer = time.AfterFunc(20*time.Second, func() {
-		mu.Lock()
-		defer mu.Unlock()
-		if r, exists := rooms[roomID]; exists && len(r.clients) == 0 {
-			delete(rooms, roomID)
-			log.Printf("🧹 Room %s cleaned up after 20s of inactivity\n", roomID)
-		}
-	})
-	mu.Unlock()
+    addr := host + ":" + port
+    log.Println("WebSocket signalling server running on", addr, "/ws")
+    log.Fatal(http.ListenAndServe(addr, nil))
 }
