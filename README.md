@@ -29,11 +29,11 @@ This backend is designed to work seamlessly with a React-based WebRTC frontend f
 | Frontend Compatibility | React, Vanilla JS, WebRTC APIs |
 
 ---
-Github backend and frontend repo
-```
-https://github.com/Rohit175041/voip_server
-https://github.com/Rohit175041/lan-voip
-```
+## 🌐 Project Links
+- 🖥️ **Backend Repository:** [voip_server](https://github.com/Rohit175041/voip_server)
+- 💻 **Frontend Repository:** [lan-voip](https://github.com/Rohit175041/lan-voip)
+- 🚀 **Live Demo:** [lan-voip.onrender.com](https://lan-voip.onrender.com)
+
 ## 📡 WebRTC P2P Architecture
 <p align="center">
   <img src="./assets/p2p.webp" alt="P2P WebRTC Architecture" width="700"/>
